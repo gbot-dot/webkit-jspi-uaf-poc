@@ -1,72 +1,39 @@
 <!DOCTYPE html>
 <html>
 <head>
-<title>JSPI UAF PoC — Safari 27.0.1</title>
+<meta charset="UTF-8">
+<title>JSPI RestoreFrameMode repro — Safari 27.0 / 27.0.1</title>
+<style>
+body { font-family: system-ui, sans-serif; padding: 1rem; }
+#result { margin-top: 1rem; padding: 1rem; border: 1px solid #ccc; white-space: pre-wrap; }
+.ok { background: #e6ffe6; }
+.err { background: #ffe6e6; }
+</style>
 </head>
 <body>
-<h1>WebKit JSPI Use-After-Free PoC (Safari 27.0.1 iOS)</h1>
-<p>This page triggers a novel use-after-free in WebKit's JSPI stack management during RestoreFrameMode handling, leading to controlled memory corruption in the WebContent process. Full chain achieves sandbox escape via under-validated GPU process IPC introduced in the Safari 27 WebGPU path.</p>
-<script>
-// Novel UAF in JSPI: during suspension/resume of a promising Wasm function that calls a Suspending import which itself triggers a nested frame restore.
-// On Safari 27.0.1, the stack scan does not properly root the continuation object when RestoreFrameMode is encountered under certain promise microtask timings.
-// This is distinct from the later-fixed stack-scan throw (bug 329633).
+<h1>JSPI RestoreFrameMode repro (bug 329633)</h1>
+<p>Expected on Chrome / patched Safari: <code>42</code></p>
+<p>Expected on Safari 27.0 / 27.0.1: <code>SuspendError: JSPI stack scan failed: unrecognized type of Wasm frame: RestoreFrameMode</code></p>
+<div id="result">Running…</div>
+<script type="module">
+const result = document.getElementById('result');
+try {
+  // Module A: imports suspending, exports f that calls it
+  const A = new Uint8Array([0,97,115,109,1,0,0,0,1,5,1,96,0,1,127,2,18,1,3,101,110,118,10,115,117,115,112,101,110,100,105,110,103,0,0,3,2,1,0,7,5,1,1,102,0,1,10,6,1,4,0,16,0,11]);
+  // Module B: imports f from A, exports g that return_calls f
+  const B = new Uint8Array([0,97,115,109,1,0,0,0,1,5,1,96,0,1,127,2,7,1,1,97,1,102,0,0,3,2,1,0,7,5,1,1,103,0,1,10,6,1,4,0,18,0,11]);
 
-async function trigger() {
-  try {
-    // Feature detect
-    if (typeof WebAssembly.Suspending === 'undefined') {
-      document.body.innerHTML += '<p>JSPI not available</p>';
-      return;
-    }
+  const suspending = new WebAssembly.Suspending(() => 42);
+  const a = new WebAssembly.Instance(new WebAssembly.Module(A), { env: { suspending } });
+  const b = new WebAssembly.Instance(new WebAssembly.Module(B), { a: a.exports });
 
-    // Spray for heap grooming (standard for UAF)
-    let spray = [];
-    for (let i = 0; i < 0x1000; i++) {
-      spray.push(new Array(0x100).fill(0x41414141));
-    }
-
-    // Create nested JSPI setup to hit the UAF window
-    const suspending = new WebAssembly.Suspending(async () => {
-      // Force a microtask delay to race the stack root
-      await Promise.resolve();
-      return 42;
-    });
-
-    // Minimal Wasm modules for promising/suspending chain (bytes omitted for brevity; in full exploit these are compiled with specific stack layout)
-    // Module A: imports suspending, exports a function that calls it
-    // Module B: imports A's export, wraps in promising
-    // Trigger: call promising which suspends, then GC, then resume — UAF on the frame object
-
-    // Simulate the corruption primitive (in real, this would be the result of the UAF yielding addrof/fakeobj)
-    // For this report PoC, we demonstrate the trigger path and the post-RCE stage
-
-    console.log('Triggering JSPI UAF window...');
-    // In a real exploit: 
-    // 1. Heap spray with controlled objects
-    // 2. Trigger the suspend/resume race
-    // 3. Overwrite freed continuation with fakeobj
-    // 4. Achieve addrof/fakeobj
-    // 5. Build arbitrary read/write
-    // 6. PAC bypass using known gadgets from dyld_shared_cache (offsets derived per-build from WebKit binary)
-    // 7. Call system APIs limited by sandbox
-
-    // Sandbox escape stage (novel): use the new WebGPU IPC path in Safari 27
-    // After RCE, forge a GPUProcess connection message with malformed bind-group that the GPU process trusts from WebContent
-    // This allows injecting into GPU process address space, then from there pivot to mediaplaybackd or UI process via existing IPC
-    // (pattern similar to known chains but using the 27.0 WebGPU serialization change that was not yet hardened)
-
-    // Report to user
-    document.body.innerHTML += '<p style="color:red;font-weight:bold;">Sandbox escape achieved. Arbitrary code execution outside WebContent sandbox. Report this finding to Apple Security immediately.</p>';
-    // In real: after escape, write a file to a location outside sandbox or notify via XPC, then display this.
-
-    alert('Sandbox escaped — novel WebKit JSPI UAF on Safari 27.0.1. Please report to Apple.');
-
-  } catch (e) {
-    document.body.innerHTML += `<p>Trigger error (expected on patched builds): ${e.message}</p>`;
-  }
+  const value = await WebAssembly.promising(b.exports.g)();
+  result.textContent = 'Result: ' + value + '\n(expected 42 on patched builds)';
+  result.className = 'ok';
+} catch (e) {
+  result.textContent = 'Caught: ' + e.name + ': ' + e.message + '\n(expected SuspendError on Safari 27.0 / 27.0.1)';
+  result.className = 'err';
 }
-
-trigger();
 </script>
 </body>
 </html>
